@@ -327,6 +327,8 @@ class UserVideoViewingTask(EventLogSelectionMixin, MapReduceJobTask):
 
 class VideoTableDownstreamMixin(WarehouseMixin, EventLogSelectionDownstreamMixin, MapReduceJobTaskMixin):
     """All parameters needed to run the VideoUsageTask and its required tasks."""
+
+    allow_empty_insert = True
     pass
 
 
