@@ -7,7 +7,7 @@ import os
 import shutil
 import unittest
 
-from edx.analytics.tasks.tests.acceptance.services import fs, db, task, hive, vertica
+from edx.analytics.tasks.tests.acceptance.services import fs, db, task, hive, vertica, elasticsearch_service
 from edx.analytics.tasks.url import url_path_join, get_target_from_url
 
 
@@ -67,6 +67,13 @@ def when_vertica_not_available(function):
         vertica_available, 'Vertica service is available'
     )(function)
 
+
+def when_elasticsearch_available(function):
+    config = get_test_config()
+    es_available = bool(config.get('elasticsearch_host'))
+    return unittest.skipIf(
+        not es_available, 'Elasticsearch service is not available'
+    )(function)
 
 # Utility functions
 
@@ -149,6 +156,7 @@ class AcceptanceTestCase(unittest.TestCase):
         import_database_name = 'acceptance_import_' + database_name
         export_database_name = 'acceptance_export_' + database_name
         otto_database_name = 'acceptance_otto_' + database_name
+        elasticsearch_alias = 'alias_test_' + self.identifier
         self.warehouse_path = url_path_join(self.test_root, 'warehouse')
         task_config_override = {
             'hive': {
@@ -187,15 +195,25 @@ class AcceptanceTestCase(unittest.TestCase):
             'course-structure': {
                 'api_root_url': 'acceptance.test',
                 'access_token': 'acceptance'
-            }
+            },
+            'module-engagement': {
+                'alias': elasticsearch_alias
+            },
+            'elasticsearch': {}
         }
         if 'vertica_creds_url' in self.config:
             task_config_override['vertica-export'] = {
                 'credentials': self.config['vertica_creds_url'],
                 'schema': schema
             }
+        if 'elasticsearch_host' in self.config:
+            task_config_override['elasticsearch']['host'] = self.config['elasticsearch_host']
+        if 'elasticsearch_connection_class' in self.config:
+            task_config_override['elasticsearch']['connection_type'] = self.config['elasticsearch_connection_class']
         if 'manifest_input_format' in self.config:
             task_config_override['manifest']['input_format'] = self.config['manifest_input_format']
+        if 'hive_version' in self.config:
+            task_config_override['hive']['version'] = self.config['hive_version']
 
         log.info('Running test: %s', self.id())
         log.info('Using executor: %s', self.config['identifier'])
@@ -207,9 +225,17 @@ class AcceptanceTestCase(unittest.TestCase):
         self.task = task.TaskService(self.config, task_config_override, self.identifier)
         self.hive = hive.HiveService(self.task, self.config, database_name)
         self.vertica = vertica.VerticaService(self.config, schema)
+        self.elasticsearch = elasticsearch_service.ElasticsearchService(self.config, elasticsearch_alias)
 
         if os.getenv('DISABLE_RESET_STATE', 'false').lower() != 'true':
             self.reset_external_state()
+
+        max_diff = os.getenv('MAX_DIFF', None)
+        if max_diff is not None:
+            if max_diff.lower() == "infinite":
+                self.maxDiff = None
+            else:
+                self.maxDiff = int(max_diff)
 
     def reset_external_state(self):
         root_target = get_target_from_url(get_jenkins_safe_url(self.test_root))
@@ -220,6 +246,7 @@ class AcceptanceTestCase(unittest.TestCase):
         self.otto_db.reset()
         self.hive.reset()
         self.vertica.reset()
+        self.elasticsearch.reset()
 
     def upload_tracking_log(self, input_file_name, file_date):
         # Define a tracking log path on S3 that will be matched by the standard event-log pattern."

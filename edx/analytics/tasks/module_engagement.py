@@ -26,11 +26,11 @@ from edx.analytics.tasks.database_imports import ImportAuthUserTask, ImportCours
 from edx.analytics.tasks.database_imports import ImportCourseUserGroupTask
 from edx.analytics.tasks.decorators import workflow_entry_point
 from edx.analytics.tasks.elasticsearch_load import ElasticsearchIndexTask
-from edx.analytics.tasks.enrollments import CourseEnrollmentTableTask
+from edx.analytics.tasks.enrollments import ExternalCourseEnrollmentTableTask
 
 from edx.analytics.tasks.mapreduce import MapReduceJobTask, MapReduceJobTaskMixin
 from edx.analytics.tasks.pathutil import EventLogSelectionMixin, EventLogSelectionDownstreamMixin
-from edx.analytics.tasks.url import get_target_from_url, url_path_join
+from edx.analytics.tasks.url import get_target_from_url, url_path_join, ExternalURL
 from edx.analytics.tasks.util import eventlog
 from edx.analytics.tasks.util.overwrite import OverwriteOutputMixin
 from edx.analytics.tasks.mysql_load import IncrementalMysqlInsertTask, MysqlInsertTask
@@ -65,6 +65,7 @@ class OverwriteFromDateMixin(object):
                     ' in the past up to the end of the interval. Events are not always collected at the time that they'
                     ' are emitted, sometimes much later. By re-processing past days we can gather late events and'
                     ' include them in the computations.',
+        default=None,
         significant=False
     )
 
@@ -242,7 +243,6 @@ class ModuleEngagementPartitionTask(ModuleEngagementDownstreamMixin, HivePartiti
     def hive_table_task(self):
         return ModuleEngagementTableTask(
             warehouse_path=self.warehouse_path,
-            overwrite=self.overwrite,
         )
 
     @property
@@ -271,6 +271,25 @@ class ModuleEngagementMysqlTask(ModuleEngagementDownstreamMixin, IncrementalMysq
         default=False,
         config_path={'section': 'module-engagement', 'name': 'allow_empty_insert'},
     )
+    overwrite_hive = luigi.BooleanParameter(
+        default=False,
+        significant=False
+    )
+
+    def update_id(self):
+        """
+        Use the task name and date to uniquely identify this update.
+
+        This means that other significant parameters will be ignored when testing to see if this task is complete.
+        This is a deliberate choice since we really only care about the date. We should only execute this task if the
+        data for that date has never been loaded or if overwrite is True. Any other changes to parameters should not
+        cause a re-insert.
+
+        Without this, changes to any parameter would result in duplicate records being inserted into the database since
+        the hash code would change for the task, so it would be marked incomplete. Since records are only deleted if
+        overwrite is specified, then it was relatively easy to insert duplicate records into the database.
+        """
+        return '{task_name}(date={key})'.format(task_name=self.task_family, key=self.date.isoformat())
 
     @property
     def table(self):
@@ -287,7 +306,8 @@ class ModuleEngagementMysqlTask(ModuleEngagementDownstreamMixin, IncrementalMysq
     @property
     def indexes(self):
         return [
-            ('course_id', 'username', 'date')
+            ('course_id', 'username', 'date'),
+            ('date',),
         ]
 
     @property
@@ -295,8 +315,8 @@ class ModuleEngagementMysqlTask(ModuleEngagementDownstreamMixin, IncrementalMysq
         partition_task = ModuleEngagementPartitionTask(
             date=self.date,
             n_reduce_tasks=self.n_reduce_tasks,
-            overwrite=self.overwrite,
-            overwrite_from_date=self.overwrite_from_date,
+            warehouse_path=self.warehouse_path,
+            overwrite=self.overwrite_hive,
         )
         return partition_task.data_task
 
@@ -304,6 +324,11 @@ class ModuleEngagementMysqlTask(ModuleEngagementDownstreamMixin, IncrementalMysq
 class ModuleEngagementIntervalTask(MapReduceJobTaskMixin, EventLogSelectionDownstreamMixin, WarehouseMixin,
                                    OverwriteOutputMixin, OverwriteFromDateMixin, luigi.WrapperTask):
     """Compute engagement information over a range of dates and insert the results into Hive and MySQL"""
+
+    overwrite_mysql = luigi.BooleanParameter(
+        default=False,
+        significant=False
+    )
 
     def requires(self):
         for date in reversed([d for d in self.interval]):  # pylint: disable=not-an-iterable
@@ -313,14 +338,13 @@ class ModuleEngagementIntervalTask(MapReduceJobTaskMixin, EventLogSelectionDowns
                 n_reduce_tasks=self.n_reduce_tasks,
                 warehouse_path=self.warehouse_path,
                 overwrite=should_overwrite,
-                overwrite_from_date=self.overwrite_from_date,
             )
             yield ModuleEngagementMysqlTask(
                 date=date,
                 n_reduce_tasks=self.n_reduce_tasks,
                 warehouse_path=self.warehouse_path,
-                overwrite=should_overwrite,
-                overwrite_from_date=self.overwrite_from_date,
+                overwrite=should_overwrite or self.overwrite_mysql,
+                overwrite_hive=should_overwrite
             )
 
     def output(self):
@@ -548,7 +572,6 @@ class ModuleEngagementSummaryPartitionTask(ModuleEngagementDownstreamMixin, Hive
     def hive_table_task(self):
         return ModuleEngagementSummaryTableTask(
             warehouse_path=self.warehouse_path,
-            overwrite=self.overwrite,
         )
 
     @property
@@ -590,8 +613,11 @@ class ModuleEngagementSummaryMetricRangesDataTask(ModuleEngagementDownstreamMixi
 
     This task currently computes "low", "normal" and "high" ranges. The "low" range is defined as the [0, 15th
     percentile) interval. The "normal" range is defined as [15th percentile, 85th percentile). The "high" range is
-    defined as the [85th percentile, float('inf')). Note that all intervals are left-closed. Also note that it is not
-    strictly necessary to persist all three intervals, however, we do so for clarity.
+    defined as the [85th percentile, float('inf')). Note that all intervals are left-closed. Some edge cases result in
+    different ranges being emitted. For example, if only one discrete value is found for a particular metric (everyone
+    watched exactly one video or no videos ), it will emit a low range of [0, num_video_views) and a normal range of
+    [num_video_views, float('inf')). This will result in any user who watched no videos being categorized as "low" and
+    any user who watched one video will be characterized as "normal".
     """
 
     output_root = luigi.Parameter()
@@ -620,6 +646,7 @@ class ModuleEngagementSummaryMetricRangesDataTask(ModuleEngagementDownstreamMixi
         """
         metric_values = defaultdict(list)
 
+        unprocessed_metrics = set()
         first_record = None
         for line in lines:
             record = ModuleEngagementSummaryRecord.from_tsv(line)
@@ -627,22 +654,35 @@ class ModuleEngagementSummaryMetricRangesDataTask(ModuleEngagementDownstreamMixi
                 # There is some information we need to copy out of the summary records, so just grab one of them. There
                 # will be at least one, or else the reduce function would have never been called.
                 first_record = record
+
+            # don't include inactive learners in metric range computations
+            if record.days_active == 0:
+                continue
+
             for metric, value in record.get_metrics():
-                if value != 0:
-                    # NOTE: a lot of people don't participate, so don't include them in the analysis. Otherwise it would
-                    # look like doing *anything* in the course meant you were doing really well.
-                    metric_values[metric].append(value)
+                unprocessed_metrics.add(metric)
+                if metric == 'problem_attempts_per_completed' and record.problem_attempts == 0:
+                    # The learner needs to have at least attempted one problem in order for their float('inf') to be
+                    # included in the metric ranges. If the ratio is 0/0 we ignore the record.
+                    continue
+                metric_values[metric].append(value)
 
         for metric in sorted(metric_values):
+            unprocessed_metrics.remove(metric)
             values = metric_values[metric]
             normal_lower_bound, normal_upper_bound = numpy.percentile(  # pylint: disable=no-member
                 values, [self.low_percentile, self.high_percentile]
             )
-            ranges = [
-                (METRIC_RANGE_LOW, 0, normal_lower_bound),
-                (METRIC_RANGE_NORMAL, normal_lower_bound, normal_upper_bound),
-                (METRIC_RANGE_HIGH, normal_upper_bound, float('inf')),
-            ]
+            ranges = []
+            if normal_lower_bound > 0:
+                ranges.append((METRIC_RANGE_LOW, 0, normal_lower_bound))
+
+            if normal_lower_bound == normal_upper_bound:
+                ranges.append((METRIC_RANGE_NORMAL, normal_lower_bound, float('inf')))
+            else:
+                ranges.append((METRIC_RANGE_NORMAL, normal_lower_bound, normal_upper_bound))
+                ranges.append((METRIC_RANGE_HIGH, normal_upper_bound, float('inf')))
+
             for range_type, low_value, high_value in ranges:
                 yield ModuleEngagementSummaryMetricRangeRecord(
                     course_id=course_id,
@@ -653,6 +693,17 @@ class ModuleEngagementSummaryMetricRangesDataTask(ModuleEngagementDownstreamMixi
                     low_value=low_value,
                     high_value=high_value
                 ).to_string_tuple()
+
+        for metric in unprocessed_metrics:
+            yield ModuleEngagementSummaryMetricRangeRecord(
+                course_id=course_id,
+                start_date=first_record.start_date,
+                end_date=first_record.end_date,
+                metric=metric,
+                range_type='normal',
+                low_value=0,
+                high_value=float('inf')
+            ).to_string_tuple()
 
     def output(self):
         return get_target_from_url(self.output_root)
@@ -693,7 +744,6 @@ class ModuleEngagementSummaryMetricRangesPartitionTask(ModuleEngagementDownstrea
     def hive_table_task(self):
         return ModuleEngagementSummaryMetricRangesTableTask(
             warehouse_path=self.warehouse_path,
-            overwrite=self.overwrite,
         )
 
     @property
@@ -709,8 +759,12 @@ class ModuleEngagementSummaryMetricRangesPartitionTask(ModuleEngagementDownstrea
 class ModuleEngagementSummaryMetricRangesMysqlTask(ModuleEngagementDownstreamMixin, MysqlInsertTask):
     """Result store storage for the metric ranges."""
 
-    overwrite = luigi.BooleanParameter(default=True, description='Overwrite the table when writing to it by default.'
-                                                                 ' Allow users to override this behavior if they want.')
+    overwrite = luigi.BooleanParameter(
+        default=True,
+        description='Overwrite the table when writing to it by default. Allow users to override this behavior if they '
+                    'want.',
+        significant=False
+    )
 
     @property
     def table(self):
@@ -890,7 +944,6 @@ class ModuleEngagementUserSegmentPartitionTask(ModuleEngagementDownstreamMixin, 
     def hive_table_task(self):
         return ModuleEngagementUserSegmentTableTask(
             warehouse_path=self.warehouse_path,
-            overwrite=self.overwrite,
         )
 
     @property
@@ -943,6 +996,17 @@ class ModuleEngagementRosterRecord(Record):
                     ' (problem_attempts_per_completed ASC, attempt_ratio_order DESC). To see struggling learners sort'
                     ' by (problem_attempts_per_completed DESC, attempt_ratio_order ASC).'
     )
+    # More user profile fields, appended after initial schema creation
+    user_id = IntegerField(description='Learner\'s user ID.')
+    language = StringField(description='Learner\'s preferred language.')
+    location = StringField(description='Learner\'s reported location.')
+    year_of_birth = IntegerField(description='Learner\'s reported year of birth.')
+    level_of_education = StringField(description='Learner\'s reported level of education.')
+    gender = StringField(description='Learner\'s reported gender.')
+    mailing_address = StringField(description='Learner\'s reported mailing address.')
+    city = StringField(description='Learner\'s reported city.')
+    country = StringField(description='Learner\'s reported country.')
+    goals = StringField(description='Learner\'s reported goals.')
 
 
 class ModuleEngagementRosterTableTask(BareHiveTableTask):
@@ -1025,7 +1089,17 @@ class ModuleEngagementRosterPartitionTask(WeekIntervalMixin, ModuleEngagementDow
                 eng.problem_attempts_per_completed IS NULL,
                 -COALESCE(eng.problem_attempts, 0),
                 COALESCE(eng.problem_attempts, 0)
-            )
+            ),
+            aup.user_id,
+            aup.language,
+            aup.location,
+            aup.year_of_birth,
+            aup.level_of_education,
+            aup.gender,
+            aup.mailing_address,
+            aup.city,
+            aup.country,
+            aup.goals
         FROM course_enrollment ce
         INNER JOIN auth_user au
             ON (ce.user_id = au.id)
@@ -1110,10 +1184,8 @@ class ModuleEngagementRosterPartitionTask(WeekIntervalMixin, ModuleEngagementDow
                 overwrite=self.overwrite,
                 overwrite_from_date=self.overwrite_from_date,
             ),
-            CourseEnrollmentTableTask(
-                interval_end=self.date,
-                n_reduce_tasks=self.n_reduce_tasks,
-                overwrite=self.overwrite,
+            ExternalCourseEnrollmentTableTask(
+                interval_end=self.date
             ),
             ImportAuthUserTask(**kwargs_for_db_import),
             ImportCourseUserGroupTask(**kwargs_for_db_import),
@@ -1289,6 +1361,9 @@ class ModuleEngagementWorkflowTask(ModuleEngagementDownstreamMixin, ModuleEngage
                     ' starting with the most recent date. A value of 0 indicates no days should be overwritten.'
     )
 
+    # Don't use the OverwriteOutputMixin since it changes the behavior of complete() (which we don't want).
+    overwrite = luigi.BooleanParameter(default=False, significant=False)
+
     def requires(self):
         overwrite_from_date = self.date - datetime.timedelta(days=self.overwrite_n_days)
         yield ModuleEngagementRosterIndexTask(
@@ -1298,10 +1373,12 @@ class ModuleEngagementWorkflowTask(ModuleEngagementDownstreamMixin, ModuleEngage
             obfuscate=self.obfuscate,
             n_reduce_tasks=self.n_reduce_tasks,
             overwrite_from_date=overwrite_from_date,
+            overwrite=self.overwrite,
         )
         yield ModuleEngagementSummaryMetricRangesMysqlTask(
             date=self.date,
             overwrite_from_date=overwrite_from_date,
+            n_reduce_tasks=self.n_reduce_tasks,
         )
 
     def output(self):

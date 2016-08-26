@@ -1,6 +1,7 @@
 """Tools for working with typed records."""
 
 from collections import OrderedDict
+import re
 import datetime
 import itertools
 
@@ -355,6 +356,11 @@ class Record(object):
             properties[field_name] = {
                 'type': field_obj.elasticsearch_type
             }
+
+            elasticsearch_format = getattr(field_obj, 'elasticsearch_format', None)
+            if elasticsearch_format:
+                properties[field_name]['format'] = elasticsearch_format
+
             if not getattr(field_obj, 'analyzed', False):
                 properties[field_name]['index'] = 'not_analyzed'
         return properties
@@ -496,6 +502,53 @@ class StringField(Field):  # pylint: disable=abstract-method
             return 'VARCHAR'
 
 
+class StringListField(Field):
+    """Represents a list of strings."""
+
+    hive_type = 'STRING'
+    sql_base_type = 'VARCHAR'
+    elasticsearch_type = 'string'
+    delimiter = '\0'
+
+    def serialize_to_string(self, value):
+        """Flatten array values to a delimited string."""
+        if not self.nullable or value is not None:
+            if isinstance(value, (list, tuple)):
+                value = self.delimiter.join(value)
+        elif value is None:
+            return DEFAULT_NULL_VALUE
+        return unicode(value)
+
+    def deserialize_from_string(self, string_value):
+        """Unpack delimited strings into an array."""
+        if self.nullable and string_value == DEFAULT_NULL_VALUE:
+            return None
+        return string_value.split(self.delimiter)
+
+
+class BooleanField(Field):
+    """Represents a field that contains a boolean."""
+
+    hive_type = sql_base_type = 'BOOLEAN'
+    elasticsearch_type = 'boolean'
+
+    def serialize_to_string(self, value):
+        """Returns a string representation of the boolean value, or NULL if nullable."""
+        if not self.nullable or value is not None:
+            value = bool(value)
+        elif value is None:
+            return DEFAULT_NULL_VALUE
+        return unicode(value)
+
+    def deserialize_from_string(self, string_value):
+        """Return a bool value, or NULL if nullable, from the given string."""
+        if self.nullable and string_value == DEFAULT_NULL_VALUE:
+            return None
+        elif hasattr(string_value, 'title') and string_value.title() == 'False':
+            return False
+        return bool(string_value)
+
+
 class IntegerField(Field):  # pylint: disable=abstract-method
     """Represents a field that contains an integer."""
 
@@ -527,6 +580,45 @@ class DateField(Field):  # pylint: disable=abstract-method
 
     def deserialize_from_string(self, string_value):
         return datetime.date(*[int(x) for x in string_value.split('-')])
+
+
+class DateTimeField(Field):  # pylint: disable=abstract-method
+    """Represents a field that contains a date and time."""
+
+    hive_type = 'STRING'
+    sql_base_type = 'DATETIME'
+    elasticsearch_type = 'date'
+    elasticsearch_format = 'strict_date_time_no_millis'  # yyyy-MM-dd'T'HH:mm:ssZZ
+    string_format = '%Y-%m-%dT%H:%M:%S.%f'  # matches tracking log format
+
+    def validate(self, value):
+        validation_errors = super(DateTimeField, self).validate(value)
+        if value is not None:
+            # Try to parse string datetimes
+            if isinstance(value, str):
+                try:
+                    self.deserialize_from_string(value)
+                except (ValueError, TypeError):
+                    validation_errors.append('The string value cannot be parsed to a datetime')
+            elif not isinstance(value, datetime.datetime):
+                validation_errors.append('The value is not a datetime')
+        return validation_errors
+
+    def serialize_to_string(self, value):
+        """Returns a string representation of the datetime value, or 'None' if nullable."""
+        if not self.nullable or value is not None:
+            if not isinstance(value, datetime.datetime):
+                value = self.deserialize_from_string(value)
+
+            if isinstance(value, datetime.datetime):
+                value = value.strftime(self.string_format)
+        return unicode(value)
+
+    def deserialize_from_string(self, string_value):
+        """Returns a datetime instance parsed from the numbers in the given string_value."""
+        if not self.nullable or string_value is not None:
+            value = datetime.datetime(*[int(x) for x in re.split(r'\D+', string_value) if x])
+        return value
 
 
 class FloatField(Field):  # pylint: disable=abstract-method
