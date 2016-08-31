@@ -51,8 +51,8 @@ class TimestampPartitionMixin(object):
     It can be used by HivePartitionTasks and tasks which invoke downstream HivePartitionTasks.
     """
     date = luigi.DateParameter(
-        default=datetime.datetime.utcnow().date(),
-        description='Date/time for the data partition.  Default is UTC today.'
+        default=datetime.datetime.utcnow(),
+        description='Date/time for the data partition.  Default is UTC now.'
                     'Note that though this is a DateParameter, it also supports datetime objects, and so can '
                     'be used to create time-based data partitions.',
     )
@@ -228,6 +228,10 @@ class CourseListTableTask(BareHiveTableTask):
 class CourseListPartitionTask(CourseListDownstreamMixin, HivePartitionTask):
     """A single hive partition of course data."""
 
+    # Write the output directly to the final destination and rely on the partition_location dir to
+    # indicate whether or not it is complete. Note that this is a custom extension to luigi.
+    enable_direct_output = True
+
     @property
     def hive_table_task(self):
         return CourseListTableTask(
@@ -248,6 +252,10 @@ class CourseListPartitionTask(CourseListDownstreamMixin, HivePartitionTask):
         """Expose the partition location path as the output root."""
         return self.partition_location
 
-    def output(self):
-        """The output of partition tasks is the partition location."""
-        return get_target_from_url(self.output_root)
+    def complete(self):
+        """
+        The current task is complete if no overwrite was requested,
+        and the output_root is present.
+        """
+        return (super(CourseListPartitionTask, self).complete() and
+                get_target_from_url(self.output_root).exists())

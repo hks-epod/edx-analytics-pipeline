@@ -79,7 +79,7 @@ class ProblemResponseTableMixin(TimestampPartitionMixin,
         description='The start date to export logs for.  Ignored if `interval` is provided.',
     )
     interval_end = luigi.DateParameter(
-        default=datetime.datetime.utcnow(),
+        default=datetime.datetime.utcnow().date(),
         significant=False,
         description='The end date to export logs for.  Ignored if `interval` is provided. '
         'Default is now, UTC.',
@@ -89,16 +89,13 @@ class ProblemResponseTableMixin(TimestampPartitionMixin,
     partition_format = luigi.Parameter(
         config_path={'section': 'problem-response', 'name': 'partition_format'},
         default='%Y%m%d',
-        description='Datetime format string for the table partition, which is applied to the configured course_id '
-                    'and interval end parameters.  Must result in a filename-safe string, or your partitions will '
+        description='Datetime format string for the table partition, which is applied to the configured '
+                    '`date` parameter.  Must result in a filename-safe string, or your partitions will '
                     'fail to be created.  It results in a combined partition containing: \n'
                     '* {course_id}: a filename-safe version of the configured course_id\n'
                     '* datetime format string:  Adjust this portion to update the data more or less frequently.\n'
                     '  The default value of "%Y%m%d" changes daily, and so allows the data to update once a day.\n'
                     '  For example, use "%Y%m%dT%H" to update hourly. See strftime for options.'
-                    'NB: Using time-based format strings with the `interval` string parameter (as opposed to setting '
-                    '`interval_start` and `interval_end`) is not recommended, as the interval parsing logic will '
-                    ' likely result in an altered timestamp.',
 
     )
 
@@ -106,7 +103,6 @@ class ProblemResponseTableMixin(TimestampPartitionMixin,
         super(ProblemResponseTableMixin, self).__init__(*args, **kwargs)
         if not self.interval:
             self.interval = luigi.date_interval.Custom(self.interval_start, self.interval_end)
-        self.date = self.interval.date_b
 
 
 class ProblemResponseTableTask(ProblemResponseTableMixin, BareHiveTableTask):
