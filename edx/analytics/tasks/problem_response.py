@@ -383,7 +383,7 @@ class ProblemResponsePartitionTask(ProblemResponseTableMixin, HivePartitionTask)
     hive_table_task = None
     data_task = None
 
-    # Write the output directly to the final destination and rely on the _SUCCESS file to
+    # Write the output directly to the final destination and rely on the partition_location dir to
     # indicate whether or not it is complete. Note that this is a custom extension to luigi.
     enable_direct_output = True
 
@@ -392,9 +392,13 @@ class ProblemResponsePartitionTask(ProblemResponseTableMixin, HivePartitionTask)
         """Expose the partition location path as the output root."""
         return self.partition_location
 
-    def output(self):
-        """The output of partition tasks is the partition location."""
-        return get_target_from_url(self.output_root)
+    def complete(self):
+        """
+        The current task is complete if no overwrite was requested,
+        and the output_root file is present.
+        """
+        return (super(ProblemResponsePartitionTask, self).complete() and
+                get_target_from_url(self.output_root).exists())
 
 
 class LatestProblemResponsePartitionTask(ProblemResponsePartitionTask):
@@ -511,7 +515,7 @@ class ProblemResponseLocationPartitionTask(ProblemResponsePartitionTask):
         Ensures that the tables and data required exist before query() is run.
         """
         return (
-            self.course_blocks_partition.hive_table_task,
+            self.course_blocks_partition,
             self.problem_response_partition,
             self.hive_table_task,
         )
@@ -572,8 +576,10 @@ class ProblemResponseReportTask(ProblemResponseDataMixin,
         if self.report_field_list_delimiter is not None:
             self.report_field_list_delimiter = ast.literal_eval(self.report_field_list_delimiter)
 
-    def requires(self):
-        return self.input_task
+    def input_hadoop(self):
+        # NOTE: The hadoop job needs the raw data to use as input, not the hive partition metadata, which is the output
+        # of the partition task
+        return get_target_from_url(self.input_task.output_root)
 
     def output(self):
         """
@@ -724,3 +730,6 @@ class ProblemResponseReportWorkflow(ProblemResponseTableMixin,
 
         # Only need to require the report_task, as the other tasks are dependencies of each other.
         yield report_task
+        yield problem_response_location_task
+        yield problem_response_task
+        yield course_blocks_task

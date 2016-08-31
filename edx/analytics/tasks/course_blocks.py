@@ -378,6 +378,10 @@ class CourseBlocksPartitionTask(CourseBlocksDownstreamMixin, HivePartitionTask):
                     'tuple contains the course_id.',
     )
 
+    # Write the output directly to the final destination and rely on the partition_location dir to
+    # indicate whether or not it is complete. Note that this is a custom extension to luigi.
+    enable_direct_output = True
+
     def __init__(self, *args, **kwargs):
         super(CourseBlocksPartitionTask, self).__init__(*args, **kwargs)
         assert self.input_root is not None or self.course_ids is not None, "Must provide input_root or course_ids."
@@ -403,9 +407,13 @@ class CourseBlocksPartitionTask(CourseBlocksDownstreamMixin, HivePartitionTask):
         """Expose the partition location path as the output root."""
         return self.partition_location
 
-    def output(self):
-        """The output of partition tasks is the partition location."""
-        return get_target_from_url(self.output_root)
+    def complete(self):
+        """
+        The current task is complete if no overwrite was requested,
+        and the output_root is present.
+        """
+        return (super(CourseBlocksPartitionTask, self).complete() and
+                get_target_from_url(self.output_root).exists())
 
     def requires(self):
         """
