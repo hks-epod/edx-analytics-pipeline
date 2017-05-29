@@ -82,10 +82,10 @@ class ProblemResponseTableMixin(TimestampPartitionMixin,
         description='The start date to export logs for.  Ignored if `interval` is provided.',
     )
     interval_end = luigi.DateParameter(
-        default=datetime.datetime.utcnow().date(),
+        default=datetime.datetime.utcnow().date() + datetime.timedelta(days=1),
         significant=False,
         description='The end date to export logs for.  Ignored if `interval` is provided. '
-        'Default is now, UTC.',
+        "Default is tomorrow, UTC, so that today's logs are always read.",
     )
 
     # Override this parameter so we can change the config_path and default value.
