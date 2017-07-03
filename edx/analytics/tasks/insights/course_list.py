@@ -204,6 +204,12 @@ class CourseListApiDataTask(CourseListDownstreamMixin, MapReduceJobTask):
     def output(self):
         return get_target_from_url(self.output_root)
 
+    def complete(self):
+        """
+        The task is complete if the output_root/_SUCCESS file is present.
+        """
+        return get_target_from_url(url_path_join(self.output_root, '_SUCCESS')).exists()
+
     def run(self):
         """
         Clear out output if data is incomplete, or if overwrite requested.
